@@ -1,0 +1,195 @@
+---
+title: "Pricing and Diversification of Hurricane Catastrophe Bonds"
+author: "Wilson Weng"
+date: today
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse); library(evd); library(knitr)
+source('../R/functions.R')
+hurr     <- readRDS('../data/clean/hurr.rds')
+mk       <- readRDS('../data/clean/mk.rds')
+bench    <- readRDS('../data/clean/bench.rds')
+p        <- readRDS('../data/clean/params.rds')
+sim      <- readRDS('../data/clean/sim.rds')
+tranches <- readRDS('../data/clean/tranches.rds')
+tr       <- readRDS('../data/clean/tranche_results.rds')
+fit_mkt  <- readRDS('../data/clean/fit_mkt.rds')
+boot     <- readRDS('../data/clean/boot.rds')
+simd     <- readRDS('../app/sim_data.rds')
+mc       <- readRDS('../app/mkt_coef.rds')
+```
+
+## Summary
+
+I built a model that prices catastrophe bonds tied to US hurricane losses. It simulates 100,000 hurricane years, prices three tranches of a cat bond, and tests whether adding a cat bond improves a stock and bond portfolio. Under the stated assumptions, a modest cat bond allocation improved risk-adjusted return and tail risk, but the estimates are very uncertain. The 45-year history is short, and a backtest shows the constant-rate model understated recent risk.
+
+Key figures: the tail of hurricane losses above \$`r p$u`B is heavy (generalized Pareto shape $\hat\xi$ = `r round(p$xi, 2)`), and big hurricanes arrive at `r round(p$lambda, 2)` per year on average.
+
+## Data and caveats
+
+| Data | Source | Use |
+|---|---|---|
+| Hurricane losses, 1980 to 2024 | NOAA billion-dollar disaster database (archived) | Severity and frequency |
+| Stock, T-bill and 10-year bond returns | Damodaran historical returns | Portfolio analysis |
+| 38 cat bond tranches (expected loss and spread) | Artemis deal directory | Market pricing line |
+
+- NOAA losses are **total economic losses**, not insured losses, and are CPI-adjusted. They are a stand-in for the loss a cat bond trigger would see.
+- The benchmark deals come from a soft market (2024 to 2026), so market-implied spreads may be low compared with other periods.
+- Only `r sum(hurr$loss_bn > p$u)` hurricanes exceed the \$`r p$u`B threshold.
+
+## Method
+
+**Cat bond payoff.** A tranche has an attachment point $A$ and an exhaustion point $D$. If the year's largest single-hurricane loss is $L$, the fraction of principal lost is
+
+$$\ell = \min\left(1, \max\left(0, \frac{L - A}{D - A}\right)\right).$$
+
+The investor's return is $R = r_f + s - \ell$, so the expected return is $r_f + (s - \mathrm{EL})$, where $s$ is the spread and $\mathrm{EL} = E[\ell]$.
+
+**Losses.** Losses above a \$`r p$u`B threshold are modeled with a generalized Pareto distribution (scale $\hat\sigma$ = `r round(p$sigma, 1)`, shape $\hat\xi$ = `r round(p$xi, 2)`). Event counts are Poisson with $\lambda$ = `r round(p$lambda, 2)` per year. Simulated losses are capped at \$`r p$cap`B.
+
+**Pricing.** Spread is predicted from expected loss with a log-log regression fitted on the 38 benchmark tranches.
+
+## Results
+
+### 1. The simulation reproduces history
+
+```{r ep}
+hist_max <- hurr |> filter(loss_bn > p$u) |> group_by(year) |> summarise(m = max(loss_bn)) |>
+  right_join(tibble(year = 1980:2024), by = 'year') |> replace_na(list(m = 0)) |>
+  arrange(desc(m)) |> mutate(rp = (n() + 1) / row_number())
+sim_ep <- sim |> arrange(desc(max_loss)) |> mutate(rp = (n() + 1) / row_number()) |>
+  filter(max_loss > 0)
+ggplot() +
+  geom_line(data = sim_ep, aes(rp, max_loss)) +
+  geom_point(data = filter(hist_max, m > 0), aes(rp, m), color = 'red') +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = 'Return period (years)', y = 'Largest hurricane loss in a year (USD billions)',
+       subtitle = 'Black: 100,000 simulated years. Red: actual years 1980 to 2024.')
+```
+
+The red historical points follow the simulated curve. The flat top at \$500B is the loss cap.
+
+### 2. Tranches and prices
+
+```{r tranches}
+tr |> transmute(Tranche = name, `Attach ($B)` = attach_bn, `Exhaust ($B)` = exhaust_bn,
+                `Expected loss` = scales::percent(EL, 0.01),
+                `P(attach)` = scales::percent(p_attach, 0.01),
+                `Spread` = scales::percent(spread, 0.01),
+                `Spread / EL` = round(multiple, 1)) |> kable()
+```
+
+```{r spread}
+ggplot(bench, aes(el_pct, spread_pct)) + geom_point() +
+  geom_point(data = tr, aes(EL * 100, spread * 100), color = 'red', size = 3) +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = 'Expected loss (%)', y = 'Spread (%)',
+       subtitle = 'Black: 38 market tranches. Red: my three tranches at the fitted market spread.')
+```
+
+The market line has $R^2$ = `r round(summary(fit_mkt)$r.squared, 2)`, so a predicted spread can be off by roughly 40%. The result is a reasonable price range, not a precise quote.
+
+### 3. Parameter uncertainty (bootstrap)
+
+```{r boot}
+boot_sum <- boot |> group_by(name) |>
+  summarise(lo = quantile(EL, 0.05), hi = quantile(EL, 0.95)) |>
+  left_join(select(tr, name, EL), by = 'name') |>
+  mutate(name = factor(name, levels = c('Junior', 'Mezzanine', 'Senior')))
+boot_sum |> transmute(Tranche = name, `Point estimate` = scales::percent(EL, 0.01),
+                      `90% interval` = paste0(scales::percent(lo, 0.01), ' to ', scales::percent(hi, 0.01))) |> kable()
+ggplot(boot_sum, aes(name, EL * 100)) +
+  geom_pointrange(aes(ymin = lo * 100, ymax = hi * 100)) +
+  scale_y_log10() + labs(x = NULL, y = 'Expected loss (%), log scale')
+```
+
+I resampled the 45 years 1,000 times and refit the model each time. The intervals are wide, especially for the Senior tranche, because only a handful of historical events inform the far tail.
+
+### 4. Backtest
+
+```{r backtest}
+train  <- hurr |> filter(year <= 2009)
+test   <- hurr |> filter(year >= 2010)
+fit_tr <- fpot(train$loss_bn, threshold = p$u)
+lam_tr <- sum(train$loss_bn > p$u) / 30
+big    <- 30
+pred   <- 15 * lam_tr * (1 - pgpd(big, loc = p$u, scale = fit_tr$estimate['scale'],
+                                  shape = fit_tr$estimate['shape']))
+bt <- c(predicted = unname(pred), actual = sum(test$loss_bn > big))
+```
+
+Fitting only on 1980 to 2009, the model predicted **`r round(bt['predicted'], 1)`** hurricanes above \$`r big`B in 2010 to 2024. **`r bt['actual']`** occurred. The constant-rate assumption fails. Frequency and losses have risen, and the model likely understates current risk.
+
+### 5. Sensitivity
+
+```{r sens}
+mezz <- filter(tranches, name == 'Mezzanine')
+mezz_el <- function(s) mean(pmin(1, pmax(0, (s$max_loss - mezz$attach_bn) / (mezz$exhaust_bn - mezz$attach_bn))))
+run_case <- function(u, cap) {
+  x <- hurr$loss_bn
+  fit <- fpot(x, threshold = u, std.err = FALSE)
+  s <- simulate_years(50000, sum(x > u) / 45, fit$estimate['scale'], fit$estimate['shape'], u, cap, seed = 1)
+  tibble(Threshold = u, Cap = cap, `Shape` = round(unname(fit$estimate['shape']), 2),
+         `Mezzanine EL` = scales::percent(mezz_el(s), 0.01))
+}
+pmap_dfr(expand_grid(u = c(3, 5, 8), cap = c(300, 500, 1000)), run_case) |> kable()
+```
+
+The Mezzanine result is stable for thresholds of \$5B to \$8B and caps of \$500B or higher. The \$3B threshold gives a heavier tail, but the shape plots showed that threshold is unstable.
+
+```{r recent}
+map_dfr(c(1980, 2000, 2010), function(start) {
+  lam <- sum(hurr$loss_bn > p$u & hurr$year >= start) / (2024 - start + 1)
+  s <- simulate_years(100000, lam, p$sigma, p$xi, p$u, p$cap, seed = 1)
+  tibble(`Event rate from` = start, `Events per year` = round(lam, 2),
+         `Mezzanine EL` = scales::percent(mezz_el(s), 0.01))
+}) |> kable()
+```
+
+Using the event rate from 2000 or 2010 onward raises the Mezzanine expected loss by about 40% to 45%.
+
+### 6. Does a cat bond help a portfolio?
+
+I replaced a share of a 60% stock, 40% bond portfolio with the Mezzanine tranche. Hurricane years are paired with randomly drawn market years, so independence from markets is assumed. The historical correlations were small and not statistically different from zero, but 45 years is too few to prove independence.
+
+```{r portfolio}
+rf  <- mc$rf
+ell <- pmin(1, pmax(0, (simd$max_loss - mezz$attach_bn) / (mezz$exhaust_bn - mezz$attach_bn)))
+spread  <- exp(mc$a + mc$b * log(mean(ell) * 100)) / 100
+cat_ret <- rf + spread - ell
+base    <- 0.6 * simd$stock + 0.4 * simd$bond
+cvar    <- function(r, a) mean(r[r <= quantile(r, a)])
+sweep <- map_dfr(seq(0, 0.4, 0.05), function(w) {
+  r <- (1 - w) * base + w * cat_ret
+  tibble(`Cat bond weight (%)` = w * 100, Sharpe = (mean(r) - rf) / sd(r),
+         `5% CVaR` = cvar(r, 0.05), `1% CVaR` = cvar(r, 0.01))
+})
+sweep |> pivot_longer(-`Cat bond weight (%)`, names_to = 'metric', values_to = 'value') |>
+  ggplot(aes(`Cat bond weight (%)`, value)) + geom_line() + geom_point() +
+  facet_wrap(~metric, scales = 'free_y', nrow = 1) + labs(y = NULL)
+sweep |> mutate(across(-1, ~ round(.x, 3))) |> kable()
+```
+
+A small allocation improves the Sharpe ratio and both tail measures. As the weight grows, the Sharpe ratio keeps rising but the 1% tail turns worse. The cat bond loses its whole principal in about 1% of years. An unconstrained mean-variance optimizer chose a 38% cat bond weight (script 07). That lifted the best Sharpe ratio from 0.63 to 0.75 and improved the 5% CVaR, but it worsened the 1% CVaR from -18% to -29%. A capped allocation of about 10% is the more defensible result.
+
+## Limitations
+
+- **Short history.** 45 years and `r sum(hurr$loss_bn > p$u)` events above the threshold. The far tail is an extrapolation.
+- **Non-stationarity.** The backtest shows frequency and losses have risen, so a constant-rate model understates current risk.
+- **Economic vs insured loss.** NOAA reports total economic loss, not the loss that triggers a bond.
+- **Pricing.** The spread line is noisy and calibrated on a soft market. Senior and Junior tranches sit near the edges of the benchmark range.
+- **Independence.** Hurricane losses are assumed independent of market returns.
+- **Loss cap.** Simulated losses are capped at \$`r p$cap`B, which matters for the Senior tranche.
+
+## Reproducing
+
+Run the scripts in `R/` in order (01 to 09), then render this file. The Shiny app in `app/` reads the files produced by script 07.
